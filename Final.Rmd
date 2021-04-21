@@ -1,0 +1,1006 @@
+---
+title: "Short-term forecasts of COVID-19 deaths"
+output:
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+Sys.setlocale("LC_TIME", "English")
+```
+
+Here, we set up the input of our parameters.
+```{r}
+## Number of boosting model 
+rep=5
+
+## The mean and standard deviation of the serial interval
+SI_mean = 5.21
+SI_sd = 4.32
+
+## The last date of the test set
+max_date = as.Date("2021-02-28")
+
+## Set up the mobility stream and the country
+stream = "Walking"
+who_country = "The United Kingdom"
+apple_country="United Kingdom"
+google_country="United Kingdom"
+
+# stream = "Average_Google_Data"
+# who_country = "Portugal"
+# apple_country="Portugal"
+# google_country="Portugal"
+```
+
+
+Load all the packages.
+
+```{r load_packages,message = FALSE}
+set.seed(19981110)
+library(data.table)
+library(tidyverse)
+library(reshape2)
+library(zoo)
+library(tseries)
+library(tidyquant)
+library(gtable)
+library(knitr)
+library(gt)
+library(gridExtra)
+library(tibbletime)
+library(forecast)
+library(itsmr)
+library(here)
+library(fpp2)
+library(tseries)
+library(bbmle)
+library(kableExtra)
+library(vars)
+library(mFilter)
+library(TSstudio)
+library(EpiEstim)
+library(incidence)
+library(R0)
+library(egg)
+library(cowplot)
+library(DT)
+library(forecastML)
+library(xgboost)
+library(gbm)
+library(mlbench)
+library(RemixAutoML)
+library(DiagrammeR)
+```
+# Functions
+This part contains the functions required for our analysis.
+
+## Reading and Cleaning the data
+
+### Reading the data
+
+Those functions read the WHO, Google and Apple mobility data sets.
+
+```{r}
+Who_read = function(){
+  WHO = read_csv("D:/学习/Oxford/学习/dissertation/datasets/2021-03-08/WHO-COVID-19-global-data.csv")
+  dim(WHO)
+  
+  WHO$WHO_region = NULL
+  WHO$Country_code = NULL
+  WHO$Date = WHO$Date_reported
+  WHO$Date_reported = NULL
+  
+  WHO = melt(WHO, id.vars=c("Country","Date")) %>% arrange(Country,Date) %>% rename(Type=variable)
+  head(WHO)
+  return(WHO)
+}
+```
+
+```{r}
+Apple_read = function(){
+  apple_raw = read_csv("D:/学习/Oxford/学习/dissertation/datasets/2021-03-08/applemobilitytrends-2021-03-07.csv")
+  apple = filter(apple_raw,geo_type == "country/region")
+  apple[4:6] = NULL
+  apple[1] = NULL
+  
+  apple = melt(apple, id.vars=c("region","transportation_type")) %>% arrange(region) %>% rename(Country=region, Type=transportation_type, Date=variable)
+  
+  apple$Date = as.Date(apple$Date)
+  apple = apple %>% spread(Type, value)
+  apple = apple %>% mutate(Average_Apple_Data=rowMeans(apple[3:5],na.rm
+  =TRUE))
+  apple = melt(apple, id.vars=c("Country","Date")) %>% arrange(Country,Date) %>% rename(Type=variable) %>% drop_na()
+  
+  apple$value = apple$value-100
+  apple$Type <- gsub("driving","Driving", apple$Type)
+  apple$Type <- gsub("walking","Walking", apple$Type)
+  apple$Type <- gsub("transit","Transit", apple$Type)
+  
+  return(apple)
+}
+```
+
+```{r}
+Google_read = function(){
+  google = read_csv("D:/学习/Oxford/学习/dissertation/datasets/2021-03-08/google/google_small3.csv")
+  google$X1 = NULL
+  google$place_id = NULL
+  ## remove parks and residential when calculating the mean
+  google = google %>% mutate(avg = rowMeans(google[c(3,4,6,7)]))
+  google = melt(google, id.vars=c("Country","Date")) %>% arrange(Country,Date) %>% rename(Type=variable)
+  
+  google$Type <- gsub("retail_and_recreation_percent_change_from_baseline","Retail_and_Recreation", google$Type)
+  google$Type <- gsub("grocery_and_pharmacy_percent_change_from_baseline","Grocery_and_Pharmacy", google$Type)
+  google$Type <- gsub("parks_percent_change_from_baseline","Parks", google$Type)
+  google$Type <- gsub("transit_stations_percent_change_from_baseline","Transit_Stations", google$Type)
+  google$Type <- gsub("workplaces_percent_change_from_baseline","Workplaces", google$Type)
+  google$Type <- gsub("residential_percent_change_from_baseline","Residential", google$Type)
+  google$Type <- gsub("avg","Average_Google_Data", google$Type)
+  
+  return(google)
+}
+```
+
+
+### Visualizing the Data
+
+```{r}
+## This function plot the mobility
+mobility_plot = function(mobility_tibble){
+  g = ggplot(mobility_tibble,aes(x=Date,value,group=Type,col=Type)) + geom_line()  + theme(legend.position="bottom") + geom_hline(yintercept=0, linetype="dashed", color = "red")
+}
+```
+
+```{r}
+## This function aligns two ggplots.
+plot_align = function(g1,g2,title=""){
+  t = intersect(g1$data$Date,g2$data$Date)
+  lower = min(t) %>% as.Date()
+  upper = max(t) %>% as.Date()
+  g = grid.arrange(g1 + scale_x_date(date_labels = "%b-%d-%Y",limits=c(lower, upper)),g2 + scale_x_date(date_labels = "%b-%d-%Y",limits=c(lower, upper)),top=title)
+}
+```
+
+```{r}
+plot_mobility_whole = function(apple_region,google_region){
+  apple_plot = mobility_plot(apple_region)
+  google_plot = mobility_plot(google_region)
+  g = plot_align(apple_plot,google_plot)
+}
+```
+
+```{r}
+## This function plots the daily new cases and deaths with their Moving Average
+who_plot = function(who_region,type,MA){
+  g = ggplot(subset(who_region,Type==type),aes(x=Date,value)) + geom_line()  + theme(legend.position="none") + geom_ma(ma_fun=SMA,n=MA,color="red",size=1.2)
+}
+
+```
+
+
+## Mobility, Transmission and Death
+
+### EpiEstim
+
+```{r}
+## the day of first death/case reported
+start_date = function(who_region){
+  min(subset(who_region,Type=="New_deaths" & value>0)$Date)
+}
+
+start_case_date = function(who_region){
+  min(subset(who_region,Type=="New_cases" & value>0)$Date)
+}
+
+```
+
+```{r}
+## Transform deaths and cases into ts objects
+
+death_ts = function(who_region){
+  start_date = start_date(who_region)
+  death_ts = who_region %>% subset(Type=="New_deaths" & Date>start_date) %>% dplyr::select(value) %>% as.ts()
+}
+
+case_ts = function(who_region){
+  start_date = start_case_date(who_region)
+  death_ts = who_region %>% subset(Type=="New_cases" & Date>start_date) %>% dplyr::select(value) %>% as.ts()
+}
+```
+
+
+
+```{r}
+## This function returns the tibble contains the estimated R with lower and upper limits by EpiEstim packages
+
+epi_model = function(who_region,mean_si,sd_si){
+  
+  ## Based on 7-day MA of death  
+  I = death_ts(who_region) %>% rollmean(7,fill=TRUE) %>% as_tibble() %>% rename(I=value)
+  
+  param_si <- EpiEstim::estimate_R(I,method="parametric_si",config = make_config(list(mean_si=mean_si, std_si=sd_si)))
+  
+  start_date = start_date(who_region)
+  tibble = param_si$R %>% mutate(Date=t_end+start_date-1)
+  
+  tibble = tibble %>% dplyr::select(`Mean(R)`,`Quantile.0.025(R)`,`Quantile.0.975(R)`,Date)
+
+  tibble = tibble %>% rename(
+    R = `Mean(R)`,
+    lower = `Quantile.0.025(R)`,
+    upper = `Quantile.0.975(R)`
+    ) %>% mutate(Type="EpiEstim")
+  
+}
+
+epi_case=function(who_region,mean_si,sd_si){
+  
+  ## Based on 7-day MA of death  
+  I = case_ts(who_region) %>% rollmean(7,fill=TRUE) %>% as_tibble() %>% rename(I=value)
+  
+  param_si <- EpiEstim::estimate_R(I,method="parametric_si",config = make_config(list(mean_si=mean_si, std_si=sd_si)))
+  
+  start_date = start_case_date(who_region)
+  tibble = param_si$R %>% mutate(Date=t_end+start_date-1)
+  
+  tibble = tibble %>% dplyr::select(`Mean(R)`,`Quantile.0.025(R)`,`Quantile.0.975(R)`,Date)
+
+  tibble = tibble %>% rename(
+    R = `Mean(R)`,
+    lower = `Quantile.0.025(R)`,
+    upper = `Quantile.0.975(R)`
+    ) %>% mutate(Type="EpiEstim Case")
+  
+}
+```
+
+### Time-dependent Method
+
+```{r}
+## This function returns the tibble contains the estimated R with lower and upper limits by the Time Dependent Method of R0 package
+
+td_model = function(who_region,mgt,nsim=100){
+  I = case_ts(who_region) %>% rollmean(7,fill=TRUE) %>% as_tibble()
+  start = start_case_date(who_region)
+  t = subset(who_region,Type=="New_cases" & Date>start)$Date
+  
+  ## Add 0.1 to avoid NA
+  estR0 <- R0::estimate.R(I$value+0.1, mgt,methods=c("TD"),nsim=100,t=t)
+  
+  tibble = estR0$estimates$TD$conf.int
+  tibble = tibble::rownames_to_column(tibble, "Date") %>% mutate(R = estR0$estimates$TD$R)
+  tibble$Date = as.Date(tibble$Date) 
+  tibble = tibble %>% mutate(Type="Time Dependent")
+}
+```
+
+```{r}
+## This functions plot the estimated R with Condifence intervals
+
+R_plot = function(R_tibble){
+  g = ggplot(R_tibble, aes(Date, R, color = Type, fill = Type)) +
+  geom_line() + geom_ribbon(aes(ymin = lower, ymax = upper), alpha =.3,colour=NA) + geom_hline(yintercept=1, linetype="dashed", color = "black") + theme(legend.position="bottom")
+}
+```
+
+### Lag between Mobility and Transmission
+
+```{r}
+## Convert R/Mobility to ts objects
+
+R_to_ts = function(tibble){
+  ts = tibble %>% unique() %>% dplyr::select(R) %>% as.ts()
+}
+
+mobility_to_ts = function(tibble,stream,start_date){
+  ts = subset(tibble,Type==stream & Date>=start_date) %>% dplyr::select(value) %>% as.ts()
+}
+
+## Detect the most positive/negative lag from ccf function
+maxmin_lag = function(ccf,lag_pos=TRUE,max=TRUE){
+  ## lag_pos = TRUE -> we need a positive lag
+  tibble = cbind(ccf$lag,ccf$acf) ## V1 = lag, V2 = ACF
+  if(lag_pos){
+    tibble = tibble %>% as_tibble() %>% subset(V1>0)
+  }else{
+    tibble = tibble %>% as_tibble() %>% subset(V1<0)
+  }
+  if(max){
+    max_lag = tibble$V1[which(tibble$V2==max(tibble$V2))] %>% as.integer()
+  }else{
+    min_lag = tibble$V1[which(tibble$V2==min(tibble$V2))] %>% as.integer()
+  }
+}
+
+## Detect the most significant lag from ccf function
+maxabs_lag = function(ccf,lag_pos=TRUE){
+  ## lag_pos = TRUE -> we need a positive lag
+  tibble = cbind(ccf$lag,ccf$acf) ## V1 = lag, V2 = ACF
+  if(lag_pos){
+    tibble = tibble %>% as_tibble() %>% subset(V1>0)
+  }else{
+    tibble = tibble %>% as_tibble() %>% subset(V1<0)
+  }
+  lag = tibble$V1[which(abs(tibble$V2)==max(abs(tibble$V2)))] %>% as.integer()
+}
+
+```
+
+```{r}
+
+## lag between mobility and R 
+ccf_mobility_R = function(R_tibble,mobility_tibble,stream,max_lag=35,pt=TRUE,d=1){
+  R_ts = R_to_ts(R_tibble) %>% rollmean(7,fill=TRUE)
+  stream_ts = mobility_to_ts(mobility_tibble,stream,R_tibble$Date[1])
+  t = ccf(R_ts %>% as.numeric() %>% diff(), stream_ts %>% as.numeric(),lag.max=max_lag,plot=pt)
+}
+
+## lag between death and mobility
+ccf_death_mobility = function(who_region,mobility_tibble,stream,max_lag=35,pt=TRUE,d=1){
+  stream_ts = mobility_to_ts(mobility_tibble,stream,start_date(who_region))
+  death_ts = who_region %>% death_ts() %>% rollmean(7,fill=TRUE)
+  t = ccf(death_ts %>% as.numeric() %>% diff(d),stream_ts %>% as.numeric(),plot=pt,lag.max=max_lag)
+}
+```
+
+
+## Forecasting
+
+### Data Prep
+
+```{r}
+## Split the ts into train and test
+
+train_ts = function(ts,h=7){
+  n = length(ts)
+  ts = ts %>% head(n-h)
+}
+
+test_ts = function(ts,h=7){
+  ts = ts %>% tail(h)
+}
+```
+
+### ARIMA Model
+
+```{r}
+model_plot = function(myforecasts,ts){
+  g = autoplot(myforecasts) + autolayer(ts)
+}
+
+## get the forecast tibble
+model_tibble = function(myforecasts,test_ts){
+  tibble = as_tibble(myforecasts) %>% mutate(observed=as.vector(test_ts) %>% as.numeric(),
+errors=`Point Forecast`-observed)
+}
+
+## compute the error
+model_error = function(tibble,h=7){
+  SSE=sum(tibble$errors^2)
+  MSE=SSE/h
+  MAE = mean(abs(tibble$errors)) %>% round()
+  sum_true = sum(tibble$observed)
+  sum_pred = sum(tibble$`Point Forecast`) %>% round()
+  return(c(MSE,MAE,sum_true,sum_pred))
+}
+
+```
+
+### VAR Model
+
+```{r}
+## lag the mobility data and match it with Death
+var_data = function(mol_tibble,stream,who_region,death_lag,death_train){
+    mol_train = subset(mol_tibble,Type==stream & Date>=(start_date(who_region)-death_lag)) %>% dplyr::select(value) %>% ts()
+  mol_train = mol_train[1:length(death_train)]
+  
+  v1 <- cbind(mol_train,death_train) %>% na.remove()
+  colnames(v1) <- cbind("Mobility","Death")
+  return(v1)
+}
+
+## Select the optimal VAR(p) by AIC
+var_p = function(ts,lag_max=35){
+  lagselect <- VARselect(ts, lag.max=lag_max, type = "both")
+  opt_p = lagselect$selection[1] %>% as.integer()
+}
+
+```
+
+### Boosting
+
+```{r}
+## Prepare the data for gradient boosting
+boost_tb = function(who_region,R_tibble,mol_tibble,h,death_lag){
+  v2 = merge(who_region,R_tibble,by="Date") %>% subset(Type.x=="New_deaths" & Type.y=="EpiEstim") %>% rename(Death=value) %>% dplyr::select(Date,Death,R)
+  v2 = merge(v2,mol_tibble) %>% subset(Type==stream) %>% rename(Mobility=value) %>% dplyr::select(Date,Death,R,Mobility)
+  
+  dates=v2$Date
+  v2$Date=NULL
+  
+  df = forecastML::create_lagged_df(v2,outcome_col=1,dates=dates,type=c("train"),horizons=c(7),lookback = c(1:max(death_lag,h)),frequency="1 day")
+  
+  return(df)
+}
+
+## Split the data frame
+train_df = function(tibble,h=7){
+  n = length(tibble$Death)
+  train = tibble[(1:(n-h)),]
+}
+
+test_df = function(tibble,h=7){
+  n = length(tibble$Death)
+  val = tibble[((n-h+1):(n)),]
+}
+
+## Compute the error
+boost_error = function(obs,pred){
+  n = length(obs)
+  error = obs - pred
+  SSE=sum(error^2)
+  MSE=SSE/n
+  MAE = mean(abs(error)) %>% round()
+  sum_true = sum(obs)
+  sum_pred = sum(pred) %>% round()
+  return(c(MSE,MAE,sum_true,sum_pred))
+}
+```
+
+
+```{r}
+## Train the optimal Boosting Model
+boost_model = function(train_tibble){
+  train_data = setDT(train_tibble) 
+  target <- "Death" 
+  features <- setdiff(colnames(train_tibble), target)
+  
+  TestModel <- RemixAutoML::AutoXGBoostRegression(
+  
+      # GPU or CPU
+      TreeMethod = "hist",
+      NThreads = parallel::detectCores(),
+      LossFunction = 'reg:squarederror',
+  
+      # Metadata args
+      model_path = normalizePath("./"),
+      metadata_path = NULL,
+      ModelID = "Test_Model_1",
+      ReturnFactorLevels = TRUE,
+      ReturnModelObjects = TRUE,
+      SaveModelObjects = FALSE,
+      SaveInfoToPDF = FALSE,
+  
+      # Data args
+      data = train_data,
+      TrainOnFull = FALSE,
+      ValidationData = NULL,
+      # TestData = test_data,
+      TargetColumnName = "Death",
+      FeatureColNames = features,
+      TransformNumericColumns = NULL,
+      Methods = c("BoxCox", "Asinh", "Asin", "Log",
+        "LogPlus1", "Sqrt", "Logit", "YeoJohnson"),
+  
+      # Model evaluation args
+      eval_metric = "mae",
+      NumOfParDepPlots = 3L,
+  
+      # Grid tuning args
+      PassInGrid = NULL,
+      GridTune = FALSE,
+      grid_eval_metric = "mae",
+      BaselineComparison = "default",
+      MaxModelsInGrid = 10L,
+      MaxRunsWithoutNewWinner = 20L,
+      MaxRunMinutes = 24L*60L,
+      Verbose = 0L,
+  
+      # ML args
+      Shuffles = 1L,
+      Trees = 1000L,
+      eta = seq(0.05, 0.4, 0.05),
+      max_depth = seq(4L, 16L, 2L),
+      min_child_weight = seq(1, 10, 1),
+      subsample = seq(0.55, 1, 0.05),
+      colsample_bytree = seq(0.55, 1, 0.05))
+  
+  return(TestModel)
+}
+```
+
+```{r}
+## Get the predictions from boosting Model
+boost_pred = function(test_tibble){
+  
+  # test_tibble$Death = NA
+  test_data = setDT(test_tibble) 
+   
+  target <- "Death" 
+  features <- setdiff(colnames(test_tibble), target)
+  
+  Preds <- RemixAutoML::AutoXGBoostScoring(
+    TargetType = "regression",
+    ScoringData = test_data,
+    FeatureColumnNames = features,
+    OneHot = FALSE,
+    ModelObject = TestModel$Model,
+    ModelPath = NULL, 
+    ModelID = "Test_Model_1",
+    ReturnFeatures = TRUE,
+    TransformNumeric = FALSE,
+    BackTransNumeric = FALSE,
+    TargetColumnName = NULL,
+    TransformationObject = NULL,
+    TransID = NULL,
+    TransPath = NULL,
+    MDP_Impute = TRUE,
+    MDP_CharToFactor = TRUE,
+    MDP_RemoveDates = TRUE,
+    MDP_MissFactor = "0",
+    MDP_MissNum = -1,)
+  
+  return(Preds$Predictions %>% round())
+}
+```
+
+
+```{r}
+## Plot the Prediction Intervals of Boosting Model
+
+boost_plot = function(who_region,pred,h,forecast_df){
+  t = length(who_region %>% death_ts()) 
+  
+  upper = pred+apply(forecast_df, 1, sd)*1.96
+  lower = pred-apply(forecast_df, 1, sd)*1.96
+  upper80 = pred+apply(forecast_df, 1, sd)*1.282
+  lower80 = pred-apply(forecast_df, 1, sd)*1.282
+  
+  pred_tibble1 = tibble(
+    Index = 1:t, 
+    Death = who_region %>% death_ts() %>% as.numeric(), 
+  )
+
+  pred_PI = tibble(
+    Index = ((t-h+1):t), 
+    Upper_PI = upper, 
+    Lower_PI = lower,
+    Death = pred,
+    Upper_80 = upper80,
+    Lower_80 = lower80,
+  )
+
+
+  g = ggplot(pred_tibble1,aes(x=Index,y=Death,col="red")) + geom_line() + geom_ribbon(pred_PI,mapping = aes(x=Index,y=Death,ymin=Lower_PI,ymax=Upper_PI),fill="blue",alpha=0.2,colour = NA)+ geom_ribbon(pred_PI,mapping =aes(x=Index,y=Death,ymin=Lower_80,ymax=Upper_80),fill="blue4",alpha=0.2,colour = NA)+geom_line(pred_PI,mapping = aes(x=Index,y=Death),col="black",alpha=1)
+}
+```
+
+#### Long Term Forecasting
+
+```{r}
+long_pred = function(who_region,R_tibble,mol_tibble,mol_new,date_new){
+  lr = length(date_new)
+  
+  ## Data Preparation
+  v2 = merge(who_region,R_tibble,by="Date") %>% subset(Type.x=="New_deaths" & Type.y=="EpiEstim") %>% rename(Death=value) %>% dplyr::select(Date,Death,R)
+  v2 = merge(v2,mol_tibble,by="Date") %>% subset(Type==stream) %>% rename(Mobility=value) %>% dplyr::select(Date,Death,R,Mobility)
+  
+  ## v2_new = v2 + simulated mobility
+  v2_new = tibble(Death=NA,R=NA,Mobility=mol_new,Date=date_new)
+  v2_new = bind_rows(v2,v2_new) %>% arrange(Date)
+  dates = v2_new$Date
+  
+  v2_new_deathR = v2_new %>% dplyr::select(Death,R)
+  df = forecastML::create_lagged_df(v2_new_deathR,dates=dates,outcome_col=1,type=c("train"),horizons=c(lr),lookback = c(1:(death_lag+lr)),frequency="1 day")
+  
+  ## Change here if we change the lr
+  death_R = df$horizon_21
+  
+  v2_new_mol = v2_new %>% dplyr::select(Mobility)
+  df2 = forecastML::create_lagged_df(v2_new_mol,dates=dates,outcome_col=1,type=c("train"),horizons=c(1),lookback = c(1:max(death_lag,lr)),frequency="1 day")
+  
+  mol_simulate = tail(df2$horizon_1,nrow(death_R))
+  
+  df_whole = cbind(death_R,mol_simulate)
+  train_tibble = train_df(df_whole,lr)
+  test_tibble = test_df(df_whole,lr)
+  
+  
+  ## Predictions
+  train_data = setDT(train_tibble) 
+  target <- "Death" 
+  features <- setdiff(colnames(train_tibble), target)
+  
+  TestModel <- RemixAutoML::AutoXGBoostRegression(
+  
+      # GPU or CPU
+      TreeMethod = "hist",
+      NThreads = parallel::detectCores(),
+      LossFunction = 'reg:squarederror',
+  
+      # Metadata args
+      model_path = normalizePath("./"),
+      metadata_path = NULL,
+      ModelID = "Test_Model_1",
+      ReturnFactorLevels = TRUE,
+      ReturnModelObjects = TRUE,
+      SaveModelObjects = FALSE,
+      SaveInfoToPDF = FALSE,
+  
+      # Data args
+      data = train_data,
+      TrainOnFull = FALSE,
+      ValidationData = NULL,
+      # TestData = test_data,
+      TargetColumnName = "Death",
+      FeatureColNames = features,
+      TransformNumericColumns = NULL,
+      Methods = c("BoxCox", "Asinh", "Asin", "Log",
+        "LogPlus1", "Sqrt", "Logit", "YeoJohnson"),
+  
+      # Model evaluation args
+      eval_metric = "mae",
+      NumOfParDepPlots = 3L,
+  
+      # Grid tuning args
+      PassInGrid = NULL,
+      GridTune = FALSE,
+      grid_eval_metric = "mae",
+      BaselineComparison = "default",
+      MaxModelsInGrid = 10L,
+      MaxRunsWithoutNewWinner = 20L,
+      MaxRunMinutes = 24L*60L,
+      Verbose = 0L,
+  
+      # ML args
+      Shuffles = 1L,
+      Trees = 1000L,
+      eta = seq(0.05, 0.4, 0.05),
+      max_depth = seq(4L, 16L, 2L),
+      min_child_weight = seq(1, 10, 1),
+      subsample = seq(0.55, 1, 0.05),
+      colsample_bytree = seq(0.55, 1, 0.05))
+  
+  test_data = setDT(test_tibble) 
+  target <- "Death" 
+  features <- setdiff(colnames(test_tibble), target)
+  
+  Preds <- RemixAutoML::AutoXGBoostScoring(
+    TargetType = "regression",
+    ScoringData = test_data,
+    FeatureColumnNames = features,
+    OneHot = FALSE,
+    ModelObject = TestModel$Model,
+    ModelPath = NULL, 
+    ModelID = "Test_Model_1",
+    ReturnFeatures = TRUE,
+    TransformNumeric = FALSE,
+    BackTransNumeric = FALSE,
+    TargetColumnName = NULL,
+    TransformationObject = NULL,
+    TransID = NULL,
+    TransPath = NULL,
+    MDP_Impute = TRUE,
+    MDP_CharToFactor = TRUE,
+    MDP_RemoveDates = TRUE,
+    MDP_MissFactor = "0",
+    MDP_MissNum = -1,)
+  
+  pred = Preds$Predictions %>% round()
+  pred[pred<0] = 0
+  return(pred)
+}
+```
+
+```{r}
+floor = function(vec){
+  vec[vec<0] = 0
+  return(round(vec))
+}
+```
+
+
+# Data Analysis
+
+## Data Visualization
+
+```{r}
+## Read the Data
+who = Who_read()
+apple = Apple_read()
+google = Google_read()
+
+who_region = subset(who,Country==who_country)
+apple_region = subset(apple,Country==apple_country)
+google_region = subset(google,Country==google_country)
+```
+
+We will plot the mobility, new cases and deaths.
+
+
+```{r}
+## Data Visualization
+
+### Mobility
+(apple_mobility_plot = mobility_plot(apple_region) + ylab("Apple Mobility"))
+(google_molbility_plot = mobility_plot(google_region) + ylab("Google Mobility"))
+unique(google_region$Type)
+unique(apple_region$Type)
+mobility_tibble = bind_rows(google_region,apple_region) %>% arrange(Date,Type)
+
+## Case and Death
+(new_case_plot = who_plot(who_region,"New_cases",7) + ylab("Daily New Cases"))
+(new_death_plot = who_plot(who_region,"New_deaths",7) + ylab("Daily New Deaths"))
+```
+
+We won't do apple-Google mobility because: 1. They are very similar. No need to do it. 2. To avoid double counting: Transit (Apple) - Transit Stations (Google). Not all types of mobility are equally weighted.
+
+## Correlations between Mobility, Transmission and Death
+
+```{r}
+## Transmission (R0)
+## We may need sensitivity analysis on those parameters
+
+### EpiEstim (Pierre Nouvellet: mean=4.8, sd=2.7)
+epi_tibble= epi_model(who_region,SI_mean,SI_sd)
+
+### TD method (Quantifying SARS-CoV-2 transmission: 5.0, 1.9, Weibull)
+mgt<-generation.time("weibull", c(5.0, 1.9))
+td_tibble = td_model(who_region,mgt)
+# td_tibble= epi_case(who_region,4.8,2.7)
+
+R_tibble = bind_rows(epi_tibble,td_tibble) %>% arrange(Date,Type)
+head(R_tibble)
+(death_mobility_plot = plot_align(R_plot(R_tibble)+ylim(c(0,8))+ylab("Estimated R"),mobility_plot(apple_region)+ylab("Apple Mobility"),title="Estimated R and Mobility"))
+```
+
+### Lag between Mobility and Transmission
+
+```{r}
+## lag between mobility and R
+mol_tibble = bind_rows(apple_region,google_region) %>% as_tibble() %>% arrange(Date,Type)
+
+who_region = who_region %>% subset(Date<=max_date)
+R_tibble = R_tibble %>% subset(Date<=max_date)
+mol_tibble = mol_tibble %>% subset(Date<=max_date)
+
+
+### EpiEstim Method (This is the cross correlation between R0 and mobility)
+t = ccf_mobility_R(epi_tibble,mol_tibble,stream,35) 
+maxmin_lag(t,lag_pos=TRUE,max=TRUE) %>% print()
+
+### TD (This is the cross correlation between R0 and mobility)
+t = ccf_mobility_R(td_tibble,mol_tibble,stream,14)
+maxmin_lag(t,lag_pos=FALSE,max=TRUE) %>% print()
+
+## (This is the cross correlation between death and mobility)
+t = ccf_death_mobility(who_region,mol_tibble,stream,max_lag=35,pt=FALSE)
+
+plot(t, main = "", ylab="Cross-Correlation between Death and Mobility", xlab="Lag of Death",ylim=c(-max(abs(t$acf)),max(abs(t$acf))))
+
+## Compute the lag between mobility and Death
+(death_lag = maxabs_lag(t,lag_pos=TRUE) %>% print())
+```
+
+## Forecasting
+
+### ARIMA and VAR
+
+```{r}
+## Choose the number of steps to forecast, and split the data into train and test
+h = 7
+n = who_region %>% death_ts() %>% length()
+death_train = who_region %>% death_ts() %>% train_ts(h)
+death_test = who_region %>% death_ts() %>% test_ts(h)
+
+## VAR Model
+v1 = var_data(mol_tibble,stream,who_region,death_lag,death_train)
+opt_p = var_p(v1,lag_max = 40) %>% print() ## choose the optimal p
+var_death = VAR(v1, p=opt_p, type = "both",ic=c("AIC")) 
+var_forecast = forecast::forecast(var_death,h=7)$forecast$Death
+(VAR_plot = model_plot(var_forecast,who_region %>% death_ts())+xlim(c(n-40,n))+theme(legend.position=("none"))+xlab("Day"))
+var_death_tibble = model_tibble(var_forecast,death_test)
+print("MSE  MAE  Death_obs(last week)  Death_pred(this week)")
+(var_death_tibble %>% model_error())
+
+```
+If we have X and Y, X leads Y by k, and we want to match them, then X needs to delete its tail by k, and Y needs to delete its head by k.
+
+### Gradient Boosting
+
+Next, we will apply the boosting model.
+```{r}
+boost_tibble = boost_tb(who_region,R_tibble,mol_tibble,h,death_lag)$horizon_7
+train_tibble = train_df(boost_tibble,h) 
+test_tibble = test_df(boost_tibble,h)
+
+TestModel = boost_model(train_tibble)
+pred = boost_pred(test_tibble)
+forecast_df = data.frame(Model1=pred)
+for (i in 2:(rep)){
+  TestModel = boost_model(train_tibble)
+  pred = boost_pred(test_tibble)
+  forecast_df[,paste0("Model", i)] = pred
+}
+
+pred = apply(forecast_df, 1, mean) %>% round()
+
+(boosting_plot = boost_plot(who_region,pred,h,forecast_df)+xlim(c(n-40,n))+ theme(legend.position="none")+xlab("Day")+ggtitle("Forecasts From Gradient Boosting"))
+
+TestModel = boost_model(train_tibble)
+TestModel$VI_Plot
+print("MSE  MAE  Death_obs(last week)  Death_pred(this week)")
+boost_error(death_test,pred)
+```
+
+### ARIMAX Model
+
+
+```{r}
+# v2 = merge(who_region,R_tibble,by="Date") %>% subset(Type.x=="New_deaths" & Type.y=="EpiEstim") %>% rename(Death=value) %>% dplyr::select(Date,Death,R)
+v2 = merge(who_region,mol_tibble,by="Date") %>% subset(Type.x=="New_deaths" & Type.y==stream & Date>=(start_date(who_region)-death_lag)) %>% rename(Mobility=value.y,Death=value.x) %>% dplyr::select(Death,Mobility,Date)
+
+n = length(v2$Death)
+
+train_death = head(v2$Death,n-7)
+test_death = tail(v2$Death,7)
+train_mol = head(v2$Mobility,n-7)
+test_mol = tail(v2$Mobility,7)
+
+arimax_death = auto.arima(ts(train_death,frequency=7),xreg=train_mol,d=1,seasonal=TRUE,ic=c("aicc"),max.p=10,max.q=10)
+arimax_forecast = forecast::forecast(arimax_death,h=7,xreg=test_mol)
+(arimax_plot = model_plot(arimax_forecast,ts(v2$Death,frequency=7)) + xlim(c(n/7-4,n/7+1)) + theme(legend.position = "none") + xlab("Week")+ylab("Death"))
+arimax_death_tibble = arimax_forecast %>% model_tibble(test_death)
+print("MSE  MAE  Death_obs(last week)  Death_pred(this week)")
+(arimax_death_tibble %>% model_error())
+```
+
+```{r}
+summary(arimax_death)
+```
+
+
+### Long Run Forecasting
+
+```{r}
+lr = 30
+
+## Forecasting the Mobility
+mol = v2$Mobility %>% ts(frequency=7)
+arima_mol = forecast::auto.arima(mol,d=1,seasonal = TRUE,ic=c("aic"),trace=FALSE,stationary=FALSE,max.p=10,max.q=10)
+mol_forecast = forecast::forecast(arima_mol,h=lr)
+
+Current_Mobility = mol_forecast$mean
+Low_Mobility = Current_Mobility-min(Current_Mobility)+min(mol) ## min(Low_Mobility)=min(x)
+Baseline_Mobility = Current_Mobility - mean(Current_Mobility) ## mean(Baseline_Mobility)=0
+
+(Mobility_simulate = autoplot(mol)+autolayer(Low_Mobility)+autolayer(Baseline_Mobility)+autolayer(Current_Mobility)+xlim(c((n-lr)/7,(n+lr)/7+1))+ylab("Mobility")+xlab("Week")+ggtitle("Simulation of Mobility under Different Situations"))
+
+```
+
+
+
+
+```{r}
+k = ts(v2$Death,frequency=7)
+
+arimax_full = Arima(k,xreg=v2$Mobility,model=arimax_death)
+
+arimax_base = forecast::forecast(arimax_full,xreg=Baseline_Mobility)
+Baseline = floor(arimax_base$mean)
+sum(Baseline)
+
+arimax_current = forecast::forecast(arimax_full,xreg=Current_Mobility)
+Current = floor(arimax_current$mean)
+sum(Current)
+
+arimax_strict = forecast::forecast(arimax_full,xreg=Low_Mobility)
+Low = floor(arimax_strict$mean)
+sum(Low)
+
+(long_run_plot = autoplot(ts(v2$Death,frequency=7))+autolayer(Baseline)+autolayer(Current) +autolayer(Low) + xlim(c((n-lr)/7,(n+lr)/7)+1) + xlab("Week")+ylab("Death")+ggtitle("Predicted Deaths under Different Situations"))
+```
+
+# Export the Results
+
+## Tables
+
+```{r}
+ensemble_pred = (var_death_tibble$`Point Forecast`+arimax_death_tibble$`Point Forecast`+pred)/3
+ensemble_pred = ensemble_pred %>% round()
+
+df = NULL %>% rbind(var_death_tibble %>% model_error()) %>% rbind(arimax_death_tibble %>% model_error()) %>% rbind(boost_error(death_test,pred)) %>% rbind(boost_error(death_test,ensemble_pred))
+
+colnames(df) = c("RMSE","MAE","Death_obs (last week)","Death_pred (this week)")
+models = c("VAR","ARIMAX","Boosting","Ensemble")
+
+pred_summary = as_tibble(df) %>% mutate(Model=models) %>% arrange(MAE)
+pred_summary$RMSE = pred_summary$RMSE %>% sqrt()
+pred_summary
+```
+
+
+```{r}
+long_run_tb = tibble(Type=c("Baseline","Current","Low"),Death=c(sum(Baseline),sum(Current),sum(Low)))
+long_run_tb
+```
+
+## pdf
+
+```{r}
+somePDFPath = paste0(who_country,"-",stream,".pdf")
+pdf(somePDFPath)  
+
+apple_mobility_plot
+google_molbility_plot
+new_case_plot
+new_death_plot
+
+grid::grid.newpage()
+grid.table(pred_summary)
+
+(death_mobility_plot = plot_align(R_plot(R_tibble)+ylim(c(0,8))+ylab("Estimated R0"),mobility_plot(apple_region)+ylab("Apple Mobility"),title="Estimated R0 and Mobility"))
+
+plot(t, main = "", ylab="Cross-Correlation between Death and Mobility", xlab="Lag of Death",ylim=c(-max(abs(t$acf)),max(abs(t$acf))))
+
+VAR_plot
+boosting_plot
+TestModel$VI_Plot
+arimax_plot
+Mobility_simulate
+long_run_plot
+
+grid::grid.newpage()
+grid.table(long_run_tb)
+
+dev.off()
+```
+
+## SA
+
+```{r}
+# df = NULL %>% rbind(var_death_tibble %>% model_error()) %>% rbind(arimax_death_tibble %>% model_error()) %>% rbind(boost_error(death_test,pred)) %>% rbind(boost_error(death_test,ensemble_pred)) %>% cbind(who_country) %>% cbind(stream)
+# 
+# df[,3] = SI_mean
+# df[,4] = SI_sd
+# 
+# colnames(df) = c("MSE","MAE","Mean of SI","SD of SI","Country","Stream")
+# models = c("VAR","ARIMAX","Boosting","Ensemble")
+# 
+# pred_summary = as_tibble(df) %>% mutate(Model=models) %>% subset(Model=="Boosting" | Model=="Ensemble")
+# pred_summary$MSE = as.numeric(pred_summary$MSE) %>% round()
+# pred_summary$MAE = as.numeric(pred_summary$MAE) %>% round()
+# pred_summary$`Mean of SI` = as.numeric(pred_summary$`Mean of SI`)
+# pred_summary$`SD of SI` = as.numeric(pred_summary$`SD of SI`)
+# 
+# x = read_csv("SA.csv")
+# x = bind_rows(x,pred_summary) %>% unique() %>% arrange(Country,`Mean of SI`,Model)
+# write.csv(x,"SA.csv",row.names = FALSE)
+```
+
+
+
+```{r}
+# x = read_csv("D://学习//Oxford//学习//dissertation//results//UK//tables//compare final.csv")
+# x = melt(x,id.vars=c("Country")) %>% rename(Type=variable) %>% subset(Type!="IC_error") %>% subset(Type!="ARIMA_error")
+# 
+# compare = ggplot(x,aes(x=Type,y=value,fill=Type)) +
+# geom_bar(position="dodge",stat="identity") + facet_wrap(~Country) +
+# scale_fill_viridis_d() + ylab("Death")+
+# theme(axis.title.x =element_blank(),
+# axis.text.x =element_blank(),axis.ticks.x=element_blank(),legend.position = "bottom")
+# 
+# png(file="D://学习//Oxford//学习//dissertation//results//UK//plot//simulate.png",res=100)
+# (Mobility_simulate + theme(legend.position = "bottom"))
+# dev.off()
+# # 
+# png(file="D://学习//Oxford//学习//dissertation//results//UK//plot//long.png",res=100)
+# (long_run_plot + theme(legend.position = "bottom"))
+# dev.off()
+```
+
+
+
+
