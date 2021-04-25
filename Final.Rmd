@@ -1,7 +1,7 @@
 ---
-title: "Short-term forecasts of COVID-19 deaths"
+title: "Forecasts of COVID-19 deaths"
 output:
-  pdf_document:
+  html_document:
     toc: yes
 ---
 
@@ -890,15 +890,18 @@ arimax_full = Arima(k,xreg=v2$Mobility,model=arimax_death)
 
 arimax_base = forecast::forecast(arimax_full,xreg=Baseline_Mobility)
 Baseline = floor(arimax_base$mean)
-sum(Baseline)
+Baseline_lower = floor(arimax_base$lower[,2])
+Baseline_upper = floor(arimax_base$upper[,2])
 
 arimax_current = forecast::forecast(arimax_full,xreg=Current_Mobility)
 Current = floor(arimax_current$mean)
-sum(Current)
+Current_lower = floor(arimax_current$lower[,2])
+Current_upper = floor(arimax_current$upper[,2])
 
 arimax_strict = forecast::forecast(arimax_full,xreg=Low_Mobility)
 Low = floor(arimax_strict$mean)
-sum(Low)
+Low_lower = floor(arimax_strict$lower[,2])
+Low_upper = floor(arimax_strict$upper[,2])
 
 (long_run_plot = autoplot(ts(v2$Death,frequency=7))+autolayer(Baseline)+autolayer(Current) +autolayer(Low) + xlim(c((n-lr)/7,(n+lr)/7)+1) + xlab("Week")+ylab("Death")+ggtitle("Predicted Deaths under Different Situations"))
 ```
@@ -923,7 +926,10 @@ pred_summary
 
 
 ```{r}
-long_run_tb = tibble(Type=c("Baseline","Current","Low"),Death=c(sum(Baseline),sum(Current),sum(Low)))
+long_run_tb = tibble(Type=c("Baseline","Current","Low"),
+                     Death=c(sum(Baseline),sum(Current),sum(Low)),
+                     Death_lower=c(sum(Baseline_lower),sum(Current_lower),sum(Low_lower)),
+                     Death_upper=c(sum(Baseline_upper),sum(Current_upper),sum(Low_upper)))
 long_run_tb
 ```
 
@@ -996,8 +1002,8 @@ dev.off()
 # (Mobility_simulate + theme(legend.position = "bottom"))
 # dev.off()
 # # 
-# png(file="D://学习//Oxford//学习//dissertation//results//UK//plot//long.png",res=100)
-# (long_run_plot + theme(legend.position = "bottom"))
+# png(file="D://学习//Oxford//学习//dissertation//results//UK//plot//google.png",res=100,height=600,width=600)
+# google_molbility_plot
 # dev.off()
 ```
 
